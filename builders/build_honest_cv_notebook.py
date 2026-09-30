@@ -1,0 +1,281 @@
+"""Builds biohub_v19_honest_cv_submit.ipynb — public 50-epoch weights, HONEST CV on the clips that model never trained on (its dataset_splits.json), wider post-processing sweep, conservative selection -> submission."""
+import base64
+import sys
+from pathlib import Path
+
+import nbformat as nbf
+from nb_common import LOCATE_CELL, PIP_CELL
+
+def _b64(p): return base64.b64encode(Path(p).read_bytes()).decode()
+
+cells = []
+md = lambda s: cells.append(nbf.v4.new_markdown_cell(s))
+code = lambda s: cells.append(nbf.v4.new_code_cell(s))
+
+md("""# Biohub · v19 — honest CV (held-out fold of the public weights) → post-processing sweep → submission
+
+**Inputs**: competition data + `biohub-prep-bundle-v2` Output (wheels + repo) + the public dataset
+**`pilkwang/biohub-tracking-support-pack-50ep-v1`** (official baseline trained 50 epochs; `WEIGHTS_DIR_HINT` picks it) —
+the v13 Output may stay attached (it is ignored when the hint matches). Also saves `raw_cache/` (TTA, det 0.99) of the 12 CV clips for CPU follow-ups
+(`weights/unet_transformer/split_0/edge_predictor_best.pth`) + optionally the **v15 Output** (`best_config.json`
+= the best CV setting of the post-processing sweep; used as FINAL_CONFIG when `USE_BEST_CONFIG=True`). GPU T4 x2, Internet off.
+
+1. `RUN_CV=True`: scores a few post-processing settings on the 12 hold-out clips (never trained on) with our
+   official-style scorer — the same 12 clips / scorer as every earlier CV, so numbers are comparable (v12 = 0.8175).
+2. `FINAL_CONFIG` is applied to the hidden test set → `submission.csv`.
+""")
+
+code('''# ------------------------------------------------------------------ 0. settings
+import os, sys, glob, time, json, subprocess, importlib, shutil
+os.environ["TQDM_DISABLE"] = "1"
+from pathlib import Path
+
+RUN_CV            = True            # CV on clips the public model did NOT train on (read from its dataset_splits.json)
+N_CV_SAMPLES      = 20              # how many of those held-out clips to score (time: ~1 min network + ILP per clip per det config)
+SELECT_BY         = "capped"        # "capped": node-count factor clipped at 1 (never reward under-prediction); "raw": as our scorer
+WEIGHTS_DIR_HINT  = "support-pack"  # substring of the checkpoint folder to use (public 50-epoch weights); "" = latest attached
+SAVE_RAW          = True            # cache the CV clips' network output in OUT_DIR/raw_cache (CPU tuning later)
+N_CV_SAMPLES      = 12
+MAX_TEST_SAMPLES  = None            # None = all test clips; 1 = quick debug; 0 = CV only, no submission (e.g. CPU run)
+DET_TTA           = True            # 4-flip test-time augmentation for detection (4x U-Net cost; set False on CPU)
+WEIGHTS_PREFER    = "edge_predictor_best.pth"   # or "edge_predictor_last.pth"
+DET_CONFIGS = {                                                     # network stage (run once per CV clip per entry, cached)
+    "t96": dict(det_threshold=0.96, pool_kernel_um=3.0),            # public notebooks' choice for these weights
+    "t99": dict(det_threshold=0.99, pool_kernel_um=3.0),            # repo default / our v16-v18 choice
+}
+POST_CONFIGS = {                                                    # linking stage (ILP re-solved per config)
+    "d14_div10": dict(use_ilp=True, ilp_appearance_weight=0.0, ilp_disappearance_weight=1.4, ilp_division_weight=1.0),  # ours
+    "d14_div05": dict(use_ilp=True, ilp_appearance_weight=0.0, ilp_disappearance_weight=1.4, ilp_division_weight=0.5),  # v18 submission
+    "rep_div10": dict(use_ilp=True, ilp_appearance_weight=0.1, ilp_disappearance_weight=0.1, ilp_division_weight=1.0),  # repo CLI defaults
+    "rep_div05": dict(use_ilp=True, ilp_appearance_weight=0.1, ilp_disappearance_weight=0.1, ilp_division_weight=0.5),
+}
+MIN_TRACK_LENS    = [1, 3, 5]                                        # short-track pruning (free, applied to each ILP solution)
+FALLBACK_CONFIG   = {**DET_CONFIGS["t99"], **POST_CONFIGS["d14_div10"], "min_track_len": 3}   # used if CV is off / incomplete
+CV_CONFIGS        = {}              # filled by the CV cell; FINAL_CONFIG = best CV entry
+FINAL_CONFIG      = "fallback"
+USE_BEST_CONFIG   = False
+POST_WORKERS      = 3               # ILP (single-threaded, up to ~5 min on dense clips) runs in worker processes while the GPU does the next clip
+TIME_BUDGET_SEC   = 11.0 * 3600   # hard wall for the whole notebook; clips not finished by then get a placeholder node
+MODEL_PREFER      = "ctc"           # (Trackastra folder preference; unused here, kept for the shared locate cell)
+
+KAGGLE_INPUT = Path(os.environ.get("KAGGLE_INPUT_DIR", "/kaggle/input"))
+OUT_DIR      = Path(os.environ.get("KAGGLE_OUTPUT_DIR", "/kaggle/working"))
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+T_START = time.time()
+print("input root:", KAGGLE_INPUT, "| output:", OUT_DIR)
+''')
+code(LOCATE_CELL)
+code(PIP_CELL)
+code('''# ------------------------------------------------------------------ 3. code + model
+import base64
+CODE_DIR = OUT_DIR / "code"; CODE_DIR.mkdir(exist_ok=True)
+for _name, _b in [("pipeline.py", "''' + _b64("pipeline.py") + '''"),
+                  ("cellmot_train.py", "''' + _b64("cellmot_train.py") + '''"),
+                  ("cellmot_infer.py", "''' + _b64("cellmot_infer.py") + '''")]:
+    (CODE_DIR / _name).write_bytes(base64.b64decode(_b))
+sys.path.insert(0, str(CODE_DIR))
+from pipeline import read_geff, score_official, micro_average, rows_for_sample, write_submission
+import cellmot_infer as CI
+assert REPO_DIR is not None, "official baseline repo not found: attach the prep-bundle v2 Output"
+P = CI.setup_predict(REPO_DIR)
+
+cands = [d / WEIGHTS_PREFER for d in CKPT_DIRS if (d / WEIGHTS_PREFER).exists()]
+assert cands, f"no {WEIGHTS_PREFER} found in inputs: attach the public support-pack dataset (or the v13 Output)"
+print("checkpoints found:", [str(c) for c in cands])
+hinted = [c for c in cands if WEIGHTS_DIR_HINT and WEIGHTS_DIR_HINT in str(c)]
+if WEIGHTS_DIR_HINT and not hinted:
+    print(f"!! no checkpoint path contains '{WEIGHTS_DIR_HINT}' -> falling back to the most recent one")
+cands = hinted or sorted(cands, key=lambda p: p.stat().st_mtime)
+WEIGHTS = cands[-1]
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if device.type == "cpu":
+    torch.set_num_threads(os.cpu_count() or 4); print("CPU mode, threads:", torch.get_num_threads(), "| det_tta:", DET_TTA)
+try:
+    model, WINDOW, DOWNSAMPLE = CI.load_model(WEIGHTS, device)
+except RuntimeError as e:                       # architecture mismatch between the public weights and our repo copy?
+    msg = str(e); print("!! load_state_dict failed:", msg[:1500])
+    raise SystemExit("weights/repo mismatch — send this log")
+print("config.json next to weights:", (WEIGHTS.parent / "config.json").read_text() if (WEIGHTS.parent / "config.json").exists() else "(none -> defaults)")
+hist_p = WEIGHTS.parent / "history.json"
+if hist_p.exists():
+    _h = json.loads(hist_p.read_text()); print(f"weights: {WEIGHTS} | trained epochs: {len(_h)} | best val acc*recall {max(r['score'] for r in _h):.4f}")
+else:
+    print("weights:", WEIGHTS)
+print("window", WINDOW, "downsample", DOWNSAMPLE, "device", device)
+
+BEST_JSON = [Path(dp) / "best_config.json" for dp, fns in _walk_pruned(KAGGLE_INPUT) if "best_config.json" in fns]
+if USE_BEST_CONFIG and BEST_JSON:
+    _b = json.loads(BEST_JSON[-1].read_text())
+    CV_CONFIGS["v15_best"] = {**_b["det"], **_b["post"], "min_track_len": _b["min_track_len"]}
+    FINAL_CONFIG = "v15_best"
+    print(f"v15 best_config.json found ({BEST_JSON[-1]}; CV {_b.get('cv_score')}) -> FINAL_CONFIG = v15_best:", CV_CONFIGS["v15_best"])
+else:
+    print("no v15 best_config.json attached -> FINAL_CONFIG =", FINAL_CONFIG)
+
+def run_clip(zp, over, log=print):
+    cfg = CI.make_cfg(**{"det_tta": DET_TTA, **over})
+    nodes, edges, w = CI.predict_clip(model, zp, device, cfg, WINDOW, DOWNSAMPLE, log=log)
+    return nodes, edges
+''')
+code('''# ------------------------------------------------------------------ 4. honest CV: clips the public weights never trained on
+import pandas as pd, collections
+def _held_out_stems():
+    """test list of split 0 in the dataset_splits.json shipped next to the public weights (None if not found)."""
+    hint = WEIGHTS_DIR_HINT or "support-pack"
+    # the official repo trains with <data-dir>/dataset_splits.json, i.e. the file shipped INSIDE the competition train folder
+    # (README: "--data-dir data/train --split 0"); look there first, then next to the public weights
+    cands = [COMP_DIR / "train" / "dataset_splits.json", COMP_DIR / "dataset_splits.json"]
+    cands += [Path(dp) / "dataset_splits.json" for dp, fns in _walk_pruned(KAGGLE_INPUT) if "dataset_splits.json" in fns and hint in str(dp)]
+    for sp in cands:
+        if sp.exists():
+            dp = sp.parent
+            try:
+                js = json.loads(sp.read_text())
+                folds = js if isinstance(js, list) else [js]
+                f0 = next((f for f in folds if isinstance(f, dict) and f.get("split", 0) == 0), folds[0])
+                stems = [str(n)[:-5] if str(n).endswith(".zarr") else str(n) for n in f0["test"]]
+                print(f"dataset_splits.json: {sp} -> split 0: {len(f0.get('train', []))} train / {len(stems)} test clips (the public weights = README recipe = split 0)")
+                return stems
+            except Exception as e:
+                print("!! could not parse", dp, e)
+    return None
+
+def capped_adj(r):
+    f = 1 - 0.1 * (r["n_pred"] - r["est"]) / r["est"] if r["est"] else 1.0
+    return r["edge_J"] * max(0.0, min(1.0, f))
+
+if RUN_CV and (COMP_DIR / "train").is_dir():
+    train_dir = COMP_DIR / "train"
+    all_stems = sorted(p.name[:-5] for p in train_dir.iterdir() if p.name.endswith(".zarr") and (train_dir / (p.name[:-5] + ".geff")).exists())
+    held = _held_out_stems()
+    if held is None:
+        print("!! no dataset_splits.json for the public weights -> falling back to our 12 clips (LEAKED for these weights: numbers will be optimistic)")
+        step = max(1, len(all_stems) // 12); held = all_stems[1::step][:12]
+    held = [h for h in held if h in all_stems]
+    step = max(1, len(held) // max(1, N_CV_SAMPLES))
+    cv_stems = held[::step][:N_CV_SAMPLES]
+    print(f"CV clips ({len(cv_stems)} of {len(held)} held-out):", cv_stems)
+    gts = {k: read_geff(train_dir / (k + ".geff")) for k in cv_stems}
+    print("GT divisions per clip:", {k: sum(1 for s_, ch in collections.Counter(gts[k]["edges"][:, 0].tolist()).items() if ch >= 2) for k in gts})
+    rows = []
+    for det_name, det_over in DET_CONFIGS.items():
+        RAW_OUT = OUT_DIR / "raw_cache" / f"{det_name}_tta{int(DET_TTA)}"
+        for clip in cv_stems:
+            if time.time() - T_START > TIME_BUDGET_SEC * 0.45:
+                print("!! CV time budget exhausted; remaining clips/configs skipped"); break
+            t0 = time.time()
+            coords, raw_edges = CI.predict_raw(model, train_dir / (clip + ".zarr"), device, CI.make_cfg(det_tta=DET_TTA, **det_over), WINDOW, DOWNSAMPLE)
+            t_net = time.time() - t0
+            if SAVE_RAW: CI.save_raw(RAW_OUT / f"{clip}.npz", coords, raw_edges)
+            line = [f"[{det_name}] {clip}: {len(coords)} det, {len(raw_edges)} cand. edges (net {t_net:.0f}s)"]
+            for pname, pover in POST_CONFIGS.items():
+                t1 = time.time()
+                nodes, edges, w = CI.postprocess(coords, raw_edges, CI.make_cfg(det_tta=DET_TTA, **det_over, **pover), log=lambda *a: None)
+                t_post = time.time() - t1
+                for L in MIN_TRACK_LENS:
+                    n2, e2, _ = CI.prune_short_tracks(nodes, edges, w, L)
+                    sc = score_official(n2, e2, gts[clip]); sc.update(config=f"{det_name}/{pname}/L{L}", det=det_name, post=pname, min_len=L, sample=clip)
+                    sc["capped_adj"] = round(capped_adj(sc), 4); rows.append(sc)
+                    if L == 3:
+                        line.append(f"    {pname}/L3 ({t_post:.0f}s): score={sc['score']:.3f} adjJ={sc['adj_edge_J']:.3f} capped={sc['capped_adj']:.3f} (tp={sc['edge_tp']} fp={sc['edge_fp']} fn={sc['edge_fn']}) "
+                                    f"rec={sc['node_recall']:.3f} n_pred/est={sc['n_pred']}/{sc['est']} | div tp/fp/fn={sc['div_tp']}/{sc['div_fp']}/{sc['div_fn']} gt_div={sc['gt_div']}")
+            print("\\n".join(line), f"| elapsed {time.time()-T_START:.0f}s", flush=True)
+    df = pd.DataFrame(rows); df.to_csv(OUT_DIR / "cv_rows.csv", index=False)
+    n_clips = df["sample"].nunique()
+    summ = []
+    for cfg_name, grp in df.groupby("config"):
+        if len(grp) == n_clips:
+            ma = micro_average(grp.to_dict("records"))
+            wts = (grp.edge_tp + grp.edge_fp + grp.edge_fn).values
+            capped = float((grp.capped_adj.values * wts).sum() / max(1, wts.sum()))
+            ma.update(config=cfg_name, capped_adjJ=round(capped, 4), capped_score=round(capped + 0.1 * ma["div_J"], 4),
+                      div_tp=int(grp.div_tp.sum()), div_fp=int(grp.div_fp.sum()), div_fn=int(grp.div_fn.sum()),
+                      n_pred=int(grp.n_pred.sum()), est=int(grp.est.sum()), node_recall=round(float(grp.node_recall.mean()), 4)); summ.append(ma)
+    key = "capped_score" if SELECT_BY == "capped" else "score"
+    summ = pd.DataFrame(summ).sort_values(key, ascending=False).set_index("config"); summ.to_csv(OUT_DIR / "cv_summary.csv")
+    display(summ[["score", "capped_score", "adj_edge_J", "capped_adjJ", "div_J", "div_tp", "div_fp", "div_fn", "node_recall", "n_pred", "est", "edge_tp", "edge_fp", "edge_fn"]].head(30))
+    best = summ.index[0]; dname, pname, L = best.split("/")
+    CV_CONFIGS[best] = {**DET_CONFIGS[dname], **POST_CONFIGS[pname], "min_track_len": int(L[1:])}
+    FINAL_CONFIG = best
+    (OUT_DIR / "best_config.json").write_text(json.dumps(dict(config=best, over=CV_CONFIGS[best], cv_score=float(summ.iloc[0]["score"]),
+                                                             cv_capped=float(summ.iloc[0]["capped_score"]), n_clips=int(n_clips), select_by=SELECT_BY), indent=1))
+    print(f"==> best ({key}): {best} score={summ.iloc[0]['score']:.4f} capped={summ.iloc[0]['capped_score']:.4f} divJ={summ.iloc[0]['div_J']:.3f} on {n_clips} clips")
+if FINAL_CONFIG == "fallback":
+    CV_CONFIGS["fallback"] = FALLBACK_CONFIG
+print("FINAL_CONFIG:", FINAL_CONFIG, "->", CV_CONFIGS[FINAL_CONFIG])
+if MAX_TEST_SAMPLES == 0:
+    print("MAX_TEST_SAMPLES = 0 -> CV only, no submission.csv (skip the next two cells)")
+''')
+code('''# ------------------------------------------------------------------ 5. inference on test -> submission.csv (net on GPU, ILP in worker processes)
+from concurrent.futures import ProcessPoolExecutor, TimeoutError as FutTimeout
+import multiprocessing as mp
+all_rows, summary = [], []
+zarrs = TEST_ZARRS if MAX_TEST_SAMPLES is None else TEST_ZARRS[:MAX_TEST_SAMPLES]
+sub_path = OUT_DIR / "submission.csv"
+over = CV_CONFIGS[FINAL_CONFIG]
+placeholder = lambda name: (name, "node", 1, 0, 0, 0, 0, -1, -1)
+remaining = lambda: TIME_BUDGET_SEC - (time.time() - T_START)
+ex = ProcessPoolExecutor(POST_WORKERS, mp_context=mp.get_context("spawn"), initializer=CI.init_worker, initargs=(str(CODE_DIR), str(REPO_DIR)))
+futs = {}                      # name -> future (submitted in order)
+t_net_sum = 0.0
+try:
+    for k, zp in enumerate(zarrs):
+        name = zp.name[:-5]
+        if remaining() < 20 * 60:             # keep 20 min to drain the workers + write the csv
+            print(f"!! time budget: stopping the network after {k} clips; the rest get a placeholder node"); break
+        t0 = time.time()
+        cfg = CI.make_cfg(det_tta=DET_TTA, **over)
+        coords, raw_edges = CI.predict_raw(model, zp, device, cfg, WINDOW, DOWNSAMPLE)
+        t_net = time.time() - t0; t_net_sum += t_net
+        futs[name] = ex.submit(CI.post_task, (coords, raw_edges, over, DET_TTA))
+        n_done = sum(f.done() for f in futs.values())
+        print(f"[{k+1}/{len(zarrs)}] {name}: net {t_net:.0f}s ({len(coords)} det, {len(raw_edges)} cand. edges) | post done {n_done}/{len(futs)} | elapsed {time.time()-T_START:.0f}s", flush=True)
+    for name in [zp.name[:-5] for zp in zarrs]:
+        f = futs.get(name)
+        rows = None
+        if f is not None:
+            try:
+                nodes, edges, t_post = f.result(timeout=max(1.0, remaining() - 5 * 60))
+                rows = rows_for_sample(name, nodes, edges) or None
+                summary.append(dict(name=name, n_nodes=len(nodes), n_edges=len(edges), t_post=round(t_post)))
+            except FutTimeout:
+                print(f"!! {name}: post-processing not finished within the budget -> placeholder")
+            except Exception as e:
+                print(f"!! {name}: post-processing failed ({type(e).__name__}: {e}) -> placeholder")
+        all_rows += rows or [placeholder(name)]
+finally:
+    ex.shutdown(wait=False, cancel_futures=True)
+if zarrs:
+    df = write_submission(all_rows, sub_path)
+    import pandas as pd
+    sm = pd.DataFrame(summary)
+    if len(sm): print(f"post-processing: {len(sm)} clips, mean {sm.t_post.mean():.0f}s, max {sm.t_post.max()}s | net mean {t_net_sum/max(1,len(futs)):.0f}s")
+    print(df.row_type.value_counts().to_dict(), "| written:", sub_path, f"{sub_path.stat().st_size/1e6:.1f} MB | total {time.time()-T_START:.0f}s")
+else:
+    print("no test inference requested (MAX_TEST_SAMPLES = 0)")
+''')
+code('''# ------------------------------------------------------------------ 6. format self-check
+import pandas as pd
+if not zarrs:
+    print("CV-only run: nothing to check")
+else:
+    sample = pd.read_csv(COMP_DIR / "sample_submission.csv")
+    sub = pd.read_csv(sub_path)
+    assert list(sub.columns) == list(sample.columns), (list(sub.columns), list(sample.columns))
+    assert sub["id"].is_unique and (sub["id"] == range(len(sub))).all()
+    nodes_ = sub[sub.row_type == "node"]; edges_ = sub[sub.row_type == "edge"]
+    assert not nodes_.duplicated(["dataset", "node_id"]).any(), "duplicate node ids within a dataset"
+    nid = set(zip(nodes_.dataset, nodes_.node_id))
+    bad = [(d, s, t) for d, s, t in zip(edges_.dataset, edges_.source_id, edges_.target_id) if (d, s) not in nid or (d, t) not in nid]
+    assert not bad, f"{len(bad)} edges reference unknown nodes, e.g. {bad[:3]}"
+    assert set(p.name[:-5] for p in zarrs) <= set(sub.dataset.unique()), "some test datasets have no rows"
+    for c in ["node_id", "t", "z", "y", "x", "source_id", "target_id"]:
+        assert np.issubdtype(sub[c].dtype, np.integer), c
+    print("format OK ✓ |", len(nodes_), "nodes,", len(edges_), "edges over", sub.dataset.nunique(), "datasets |", f"total {time.time()-T_START:.0f}s")
+''')
+
+nb = nbf.v4.new_notebook(); nb["cells"] = cells
+nb["metadata"] = {"kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"}, "language_info": {"name": "python"}}
+out_name = sys.argv[1] if len(sys.argv) > 1 else "biohub_v19b_honest_cv_submit.ipynb"
+Path(out_name).write_text(nbf.writes(nb))
+print("written", out_name, len(cells), "cells")
