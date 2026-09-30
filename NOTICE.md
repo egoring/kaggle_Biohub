@@ -2,7 +2,7 @@
 
 ## 라이선스 구조
 
-- **우리가 작성한 코드·문서**: Apache License 2.0 (`LICENSE`).
+- **우리가 작성한 코드·문서**: Copyright 2026 T1 (Kaggle: Biohub - Cell Tracking During Development). Apache License 2.0 (`LICENSE`).
 - **Kaggle 공개 노트북에서 셀 단위로 보존한 부분**: 원저작자가 Kaggle 기본 라이선스인 Apache License 2.0으로 공개. 저작자 표기를 유지하며 같은 라이선스로 재배포합니다.
 - **주최측 baseline(royerlab) 및 Trackastra 코드 조각**: BSD 3-Clause. 아래 원문 고지를 유지합니다.
 
