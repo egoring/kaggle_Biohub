@@ -6,7 +6,7 @@
 - 평가: score = adjJ + 0.1·divJ. metric hack 사용 안 함.
 
 ## 최종 제출 선택
-- 1: v33 X16 (x138 + v28f 5시드 앙상블 @0.50, DC 거부 off) = 0.960 — 0.45~0.55 플라토의 가운데.
+- 1: v33 X11 (x138 + v28f 5시드 앙상블 @0.55, DC 거부 off) = 0.960 — 0.45~0.55 플라토 안. (2026-10-02 정정: 처음에는 X16 @0.50으로 적었으나 Kaggle 제출 페이지의 실제 선택은 X11. 두 제출 모두 Public 0.96047 / Private 0.92504.)
 - 2: v33 X1 (x138 + v28e 단일 @0.80) = 0.958 — 다른 모델 계열(보험).
 - Input: Competition + Support Pack + Seed 314159 + DeepCenter + biohub-v1284-head-s075 + 분류기 Output(v28e / v28f).
 
