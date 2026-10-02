@@ -5,6 +5,8 @@
 
 > **솔루션 write-up(Kaggle 형식): [WRITEUP.md](WRITEUP.md)**
 >
+> **문제 해결 과정(가설 → 데이터 문제 → 검증 단계 순서로 정리): [APPROACH.md](APPROACH.md)**
+>
 > 이 저장소에는 노트북·빌더 스크립트·작업 노트·그림만 있습니다. **대회 데이터는 포함하지 않습니다**(규칙 2.4b, 비참가자 재배포 금지 — [Kaggle 데이터 페이지](https://www.kaggle.com/competitions/biohub-cell-tracking-during-development/data)에서 받으세요). 학습 가중치와 공개 노트북 원본도 포함하지 않으며, 가중치는 Kaggle Datasets(pilkwang)와 우리 학습 노트북 Output에서 첨부합니다. 제3자 코드의 출처와 라이선스는 [NOTICE.md](NOTICE.md). 메트릭 해킹(가짜 노드 추가, 실제 노드 삭제로 노드 수 페널티를 이용하는 방식)은 처음부터 끝까지 사용하지 않았습니다.
 
 | | |
